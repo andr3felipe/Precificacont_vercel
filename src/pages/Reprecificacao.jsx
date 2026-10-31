@@ -29,8 +29,10 @@ import SelectPrecificaCont from "../components/SelectPrecificaCont";
 
 const STORAGE_KEY = "precificacont_reprecificacao";
 const CLIENTES_STORAGE_KEY = "precificacont_clientes";
+const REFORMA_REPRECIFICACAO_KEY = "precificacont_reforma_reprecificacao";
 
 const INITIAL_FORM = {
+  clienteId: null,
   cliente: "",
   cnpj: "",
   regime: "",
@@ -393,6 +395,7 @@ export default function Reprecificacao({ setPagina }) {
 
   const itemsRef = useRef(items);
   const syncQueueRef = useRef(Promise.resolve());
+  const [carregamentoInicialConcluido, setCarregamentoInicialConcluido] = useState(false);
 
   useEffect(() => {
     itemsRef.current = items;
@@ -458,6 +461,7 @@ export default function Reprecificacao({ setPagina }) {
             STORAGE_KEY,
             JSON.stringify(cacheNormalizado)
           );
+          if (ativo) setCarregamentoInicialConcluido(true);
           return;
         }
 
@@ -471,6 +475,8 @@ export default function Reprecificacao({ setPagina }) {
           error
         );
       }
+
+      if (ativo) setCarregamentoInicialConcluido(true);
     };
 
     carregarReprecificacoes();
@@ -509,6 +515,7 @@ export default function Reprecificacao({ setPagina }) {
   const [importRows, setImportRows] = useState([]);
   const [importSelecionados, setImportSelecionados] = useState([]);
   const [form, setForm] = useState(INITIAL_FORM);
+  const [origemReforma, setOrigemReforma] = useState(null);
 
   const [permissoesModulo, setPermissoesModulo] = useState({
     carregando: true,
@@ -820,6 +827,11 @@ export default function Reprecificacao({ setPagina }) {
   );
 
   const normalizarClienteParaReprecificacao = (cliente) => ({
+    clienteId:
+      cliente.clienteId ||
+      cliente.cliente_id ||
+      cliente.id ||
+      null,
     cliente:
       cliente.cliente ||
       cliente.client_nome ||
@@ -911,6 +923,143 @@ export default function Reprecificacao({ setPagina }) {
       "",
   });
 
+  useEffect(() => {
+    if (!carregamentoInicialConcluido) return;
+
+    let contexto = null;
+
+    try {
+      const raw = localStorage.getItem(REFORMA_REPRECIFICACAO_KEY);
+      if (raw) contexto = JSON.parse(raw);
+    } catch {
+      contexto = null;
+    }
+
+    if (!contexto?.cliente) return;
+
+    const nomeCliente = String(contexto.cliente || "").trim();
+    const clienteIdContexto = String(
+      contexto.clienteId || contexto.cliente_id || ""
+    ).trim();
+    const cnpjContexto = String(contexto.cnpj || "").replace(/\D/g, "");
+
+    if (!nomeCliente && !clienteIdContexto && !cnpjContexto) return;
+
+    const normalizarTexto = (value) =>
+      String(value || "")
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .trim()
+        .toLowerCase();
+
+    const mesmoId = (item) => {
+      if (!clienteIdContexto) return false;
+
+      const ids = [
+        item?.clienteId,
+        item?.cliente_id,
+        item?.pricing_snapshot?.clienteId,
+        item?.pricing_snapshot?.cliente_id,
+      ]
+        .filter(Boolean)
+        .map((value) => String(value).trim());
+
+      return ids.includes(clienteIdContexto);
+    };
+
+    const mesmoCnpj = (item) => {
+      if (!cnpjContexto) return false;
+      return String(item?.cnpj || "").replace(/\D/g, "") === cnpjContexto;
+    };
+
+    const mesmoNome = (item) =>
+      Boolean(nomeCliente) &&
+      normalizarTexto(item?.cliente) === normalizarTexto(nomeCliente);
+
+    // Prioridade de identificação: ID real da carteira -> CNPJ -> nome.
+    const clienteJaReprecificado =
+      itemsRef.current.find(mesmoId) ||
+      itemsRef.current.find(mesmoCnpj) ||
+      itemsRef.current.find(mesmoNome);
+
+    setOrigemReforma(contexto);
+    setFilter("todos");
+
+    if (clienteJaReprecificado) {
+      setSearch(
+        clienteJaReprecificado.cnpj ||
+          clienteJaReprecificado.cliente ||
+          nomeCliente
+      );
+      setDetalheItem(clienteJaReprecificado);
+      setGestaoReajuste({
+        status: clienteJaReprecificado.status_reajuste || "Pendente",
+        novoHonorario:
+          Number(clienteJaReprecificado.novo_honorario || 0) > 0
+            ? Number(clienteJaReprecificado.novo_honorario)
+                .toFixed(2)
+                .replace(".", ",")
+            : "",
+        dataReajuste: clienteJaReprecificado.data_reajuste || "",
+      });
+
+      localStorage.removeItem(REFORMA_REPRECIFICACAO_KEY);
+      return;
+    }
+
+    try {
+      const clientes = JSON.parse(
+        localStorage.getItem(CLIENTES_STORAGE_KEY) || "[]"
+      );
+
+      const carteira = Array.isArray(clientes) ? clientes : [];
+
+      const clienteCarteira =
+        carteira.find(
+          (item) =>
+            clienteIdContexto &&
+            String(item?.id || item?.clienteId || item?.cliente_id || "").trim() ===
+              clienteIdContexto
+        ) ||
+        carteira.find(
+          (item) =>
+            cnpjContexto &&
+            String(item?.cnpj || "").replace(/\D/g, "") === cnpjContexto
+        ) ||
+        carteira.find((item) =>
+          mesmoNome({
+            cliente:
+              item?.cliente ||
+              item?.client_nome ||
+              item?.nome ||
+              item?.razao_social ||
+              item?.nome_fantasia ||
+              "",
+          })
+        );
+
+      if (clienteCarteira) {
+        setForm(normalizarClienteParaReprecificacao(clienteCarteira));
+        setModalOpen(true);
+        localStorage.removeItem(REFORMA_REPRECIFICACAO_KEY);
+        return;
+      }
+    } catch {
+      // Se a carteira local não estiver disponível, abre com o contexto recebido.
+    }
+
+    setForm((current) => ({
+      ...current,
+      clienteId: contexto.clienteId || contexto.cliente_id || null,
+      cliente: nomeCliente,
+      cnpj: contexto.cnpj || current.cnpj,
+      regime: contexto.regime || current.regime,
+      atividade: contexto.atividade || current.atividade,
+    }));
+    setModalOpen(true);
+    localStorage.removeItem(REFORMA_REPRECIFICACAO_KEY);
+  }, [carregamentoInicialConcluido]);
+
   const criarRegistroImportado = (dados) => {
     const result = calculateRepricing(dados);
 
@@ -929,6 +1078,7 @@ export default function Reprecificacao({ setPagina }) {
         id: novoUuidReprecificacao(),
         created_date: new Date().toISOString(),
         engine_version: ENGINE_VERSION,
+        clienteId: dados.clienteId || null,
         cliente: String(dados.cliente || "").trim(),
         cnpj: dados.cnpj || "",
         regime: dados.regime || "",
@@ -1395,6 +1545,7 @@ export default function Reprecificacao({ setPagina }) {
       id: novoUuidReprecificacao(),
       created_date: new Date().toISOString(),
       engine_version: ENGINE_VERSION,
+      clienteId: form.clienteId || null,
       cliente: form.cliente.trim(),
       cnpj: form.cnpj,
       regime: form.regime,
@@ -1462,6 +1613,32 @@ export default function Reprecificacao({ setPagina }) {
     <div className="precificacont-reprecificacao min-h-screen bg-slate-50">
       <style>{REPRECIFICACAO_DARK_CSS}</style>
       <div className="max-w-[1500px] mx-auto px-4 md:px-6 py-7">
+        {origemReforma ? (
+          <div className="mb-5 flex flex-col gap-3 rounded-2xl border border-emerald-200 bg-emerald-50 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <p className="text-[10px] font-bold uppercase tracking-[0.14em] text-emerald-700">
+                Origem: Reforma Tributária
+              </p>
+              <p className="mt-1 text-sm font-semibold text-slate-800">
+                {origemReforma.cliente}
+                {origemReforma.oportunidade
+                  ? ` • ${origemReforma.oportunidade}`
+                  : ""}
+              </p>
+              <p className="mt-1 text-xs text-slate-600">
+                A Reforma apenas trouxe o contexto para análise. Nenhum honorário foi alterado automaticamente.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setOrigemReforma(null)}
+              className="self-start rounded-lg border border-emerald-200 bg-white px-3 py-2 text-xs font-semibold text-emerald-700 hover:bg-emerald-100 sm:self-auto"
+            >
+              Ocultar aviso
+            </button>
+          </div>
+        ) : null}
+
         <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4 mb-7">
           <div>
             <div className="flex items-center gap-2 text-blue-700 text-sm font-medium mb-1">

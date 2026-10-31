@@ -1908,7 +1908,7 @@ export default function Clientes() {
               <Upload size={17} />
               Importar carteira
               <input
-                type="text"
+                type="file"
                 accept=".xlsx,.xls,.csv"
                 onChange={lerArquivo}
                 style={{ display: "none" }}
