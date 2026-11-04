@@ -296,7 +296,7 @@ export default function PrecificaContControl({ sessao }) {
 
       setEscritorios((resultados[0].data || []).filter((item) => !item.deleted_at));
       setUsuarios(resultados[1].data || []);
-      setUsuariosPlataforma(resultados[2].data || []);
+      setUsuariosPlataforma((resultados[2].data || []).filter((u) => !u.excluido_em));
       setCarteiras(resultados[3].data || []);
       setCobrancas(resultados[4].data || []);
       setSaude(resultados[5].data || []);
@@ -1050,9 +1050,16 @@ export default function PrecificaContControl({ sessao }) {
         pode_acessar_cliente: Boolean(form.pode_acessar_cliente),
         pode_gerenciar_equipe: Boolean(form.pode_gerenciar_equipe),
       };
-      const existente = usuariosPlataforma.find(
-        (u) => String(u.email || "").toLowerCase() === email
-      );
+      const { data: registrosMesmoEmail, error: erroEmail } = await supabase
+        .from("usuarios_plataforma")
+        .select("id,user_id,perfil,excluido_em,email")
+        .ilike("email", email);
+      if (erroEmail) throw erroEmail;
+      if (registrosMesmoEmail?.some((u) => u.excluido_em)) {
+        throw new Error("Este e-mail pertence a um colaborador excluído. Revise o cadastro histórico antes de reutilizá-lo.");
+      }
+      const existente = (registrosMesmoEmail || []).find((u) => !u.excluido_em) || null;
+      if (existente?.excluido_em) throw new Error("Este e-mail pertence a um colaborador excluído. Solicite ao administrador a revisão do cadastro antes de reutilizá-lo.");
       if (existente?.perfil === "owner") throw new Error("Não é permitido alterar o Owner.");
       if (existente?.user_id) throw new Error("Este colaborador já possui login. Abra a ficha para redefinir a senha.");
 
@@ -1144,6 +1151,7 @@ export default function PrecificaContControl({ sessao }) {
         throw new Error("Somente o Owner pode definir ou redefinir senhas.");
       }
       if (!usuario?.id) throw new Error("Colaborador não informado.");
+      if (usuario.excluido_em) throw new Error("Colaborador excluído não pode receber senha.");
       if (!novaSenha || novaSenha.length < 8) {
         throw new Error("A senha deve possuir pelo menos 8 caracteres.");
       }
@@ -1258,6 +1266,48 @@ export default function PrecificaContControl({ sessao }) {
       await carregarTudo();
     } catch (e) {
       setErro(e?.message || "Não foi possível atualizar o colaborador.");
+    }
+  };
+
+  const excluirEquipe = async (usuario) => {
+    if (perfilPlataforma?.perfil !== "owner") {
+      setErro("Somente o Owner pode excluir colaboradores.");
+      return false;
+    }
+    if (!usuario?.id || usuario.perfil === "owner" || usuario.user_id === sessao.user.id) {
+      setErro("Não é permitido excluir a conta Owner.");
+      return false;
+    }
+    const nome = usuario.nome || usuario.email || "este colaborador";
+    if (!window.confirm(`Remover ${nome} da equipe e excluir seu login no Authentication?\n\nLogs, metas e históricos serão preservados. Clientes com responsabilidade atribuída precisam ser redistribuídos antes.`)) return false;
+    if (!window.confirm(`Confirma a exclusão definitiva de ${nome}?`)) return false;
+
+    setSalvando(true);
+    setErro("");
+    setSucesso("");
+    try {
+      const { data, error } = await supabase.functions.invoke("gerenciar-acesso-usuario", {
+        body: { operacao: "excluir_colaborador", usuario_plataforma_id: usuario.id },
+      });
+      if (error) {
+        let detalhe = error.message;
+        try {
+          const resposta = await error.context?.json();
+          detalhe = resposta?.error || detalhe;
+        } catch (_) { /* Resposta sem JSON. */ }
+        throw new Error(detalhe || "Não foi possível excluir o colaborador.");
+      }
+      if (!data?.ok) throw new Error(data?.error || "Não foi possível excluir o colaborador.");
+      setSucesso(data.message || `Colaborador ${nome} excluído.`);
+      await carregarTudo();
+      return true;
+    } catch (e) {
+      console.error("Erro ao excluir colaborador:", e);
+      setErro(e?.message || "Não foi possível excluir o colaborador.");
+      await carregarTudo();
+      return false;
+    } finally {
+      setSalvando(false);
     }
   };
 
@@ -1708,6 +1758,7 @@ export default function PrecificaContControl({ sessao }) {
                   usuarioAtual={perfilPlataforma}
                   novoColaborador={() => setModalEquipe(true)}
                   alternarEquipe={alternarEquipe}
+                  excluirEquipe={excluirEquipe}
                   salvarPermissoesEquipe={salvarPermissoesEquipe}
                   definirSenhaColaborador={definirSenhaColaborador}
                   salvarCarteiraColaborador={salvarCarteiraColaborador}
@@ -2522,7 +2573,7 @@ function Financeiro({ resumo, cobrancas, escritorios, novaCobranca, alterarStatu
   );
 }
 
-function Equipe({ equipe, carteiras, escritorios, usuarioAtual, novoColaborador, alternarEquipe, salvarPermissoesEquipe, definirSenhaColaborador, salvarCarteiraColaborador, removerClienteDaCarteira, salvando }) {
+function Equipe({ equipe, carteiras, escritorios, usuarioAtual, novoColaborador, alternarEquipe, excluirEquipe, salvarPermissoesEquipe, definirSenhaColaborador, salvarCarteiraColaborador, removerClienteDaCarteira, salvando }) {
   const [abertoId, setAbertoId] = useState(null);
   const editaveis = equipe.filter((u) => u.perfil !== "owner");
   const aberto = editaveis.find((u) => u.id === abertoId) || null;
@@ -2540,6 +2591,8 @@ function Equipe({ equipe, carteiras, escritorios, usuarioAtual, novoColaborador,
         salvarCarteira={salvarCarteiraColaborador}
         removerCliente={removerClienteDaCarteira}
         alternarEquipe={alternarEquipe}
+        excluirEquipe={excluirEquipe}
+        podeExcluir={usuarioAtual?.perfil === "owner"}
         salvando={salvando}
         fechar={() => setAbertoId(null)}
       />
@@ -2585,7 +2638,7 @@ function Equipe({ equipe, carteiras, escritorios, usuarioAtual, novoColaborador,
   );
 }
 
-function FichaColaborador({ usuario, carteiras, escritorios, salvar, definirSenha, podeGerenciarCredenciais, salvarCarteira, removerCliente, alternarEquipe, salvando, fechar }) {
+function FichaColaborador({ usuario, carteiras, escritorios, salvar, definirSenha, podeGerenciarCredenciais, salvarCarteira, removerCliente, alternarEquipe, excluirEquipe, podeExcluir, salvando, fechar }) {
   const [f, setF] = useState({
     nome: usuario.nome || "",
     email: usuario.email || "",
@@ -2621,6 +2674,7 @@ function FichaColaborador({ usuario, carteiras, escritorios, salvar, definirSenh
         <div className="flex items-center gap-2">
           <Badge tipo={usuario.ativo !== false ? "ativo" : "inativo"}>{usuario.ativo !== false ? "Ativo" : "Inativo"}</Badge>
           <button onClick={()=>alternarEquipe(usuario)} className="rounded-xl border border-slate-200 px-3 py-2 text-xs font-black">{usuario.ativo !== false ? "Inativar" : "Ativar"}</button>
+          {podeExcluir ? <button disabled={salvando} onClick={async () => { const excluido = await excluirEquipe(usuario); if (excluido) fechar(); }} className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-black text-rose-700 disabled:opacity-50"><Trash2 size={13} className="mr-1 inline"/>Excluir definitivamente</button> : null}
         </div>
       </div>
 
