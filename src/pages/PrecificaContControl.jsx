@@ -296,7 +296,7 @@ export default function PrecificaContControl({ sessao }) {
 
       setEscritorios((resultados[0].data || []).filter((item) => !item.deleted_at));
       setUsuarios(resultados[1].data || []);
-      setUsuariosPlataforma(resultados[2].data || []);
+      setUsuariosPlataforma((resultados[2].data || []).filter((u) => !u.excluido_em));
       setCarteiras(resultados[3].data || []);
       setCobrancas(resultados[4].data || []);
       setSaude(resultados[5].data || []);
@@ -1027,12 +1027,18 @@ export default function PrecificaContControl({ sessao }) {
     setErro("");
     setSucesso("");
     try {
+      if (perfilPlataforma?.perfil !== "owner") {
+        throw new Error("Somente o Owner pode cadastrar colaboradores com login automático.");
+      }
       const nome = form.nome?.trim();
       const email = form.email?.trim()?.toLowerCase();
-
+      const senha = form.senha || "";
       if (!nome) throw new Error("Informe o nome do colaborador.");
-      if (!email) throw new Error("Informe o e-mail do colaborador.");
-
+      if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        throw new Error("Informe um e-mail válido.");
+      }
+      if (senha.length < 8) throw new Error("A senha provisória deve ter pelo menos 8 caracteres.");
+      if (senha !== form.confirmarSenha) throw new Error("As senhas não conferem.");
       const payload = {
         nome,
         email,
@@ -1044,47 +1050,51 @@ export default function PrecificaContControl({ sessao }) {
         pode_acessar_cliente: Boolean(form.pode_acessar_cliente),
         pode_gerenciar_equipe: Boolean(form.pode_gerenciar_equipe),
       };
+      const { data: registrosMesmoEmail, error: erroEmail } = await supabase
+        .from("usuarios_plataforma")
+        .select("id,user_id,perfil,excluido_em,email")
+        .ilike("email", email);
+      if (erroEmail) throw erroEmail;
+      if (registrosMesmoEmail?.some((u) => u.excluido_em)) {
+        throw new Error("Este e-mail pertence a um colaborador excluído. Revise o cadastro histórico antes de reutilizá-lo.");
+      }
+      const existente = (registrosMesmoEmail || []).find((u) => !u.excluido_em) || null;
+      if (existente?.excluido_em) throw new Error("Este e-mail pertence a um colaborador excluído. Solicite ao administrador a revisão do cadastro antes de reutilizá-lo.");
+      if (existente?.perfil === "owner") throw new Error("Não é permitido alterar o Owner.");
+      if (existente?.user_id) throw new Error("Este colaborador já possui login. Abra a ficha para redefinir a senha.");
 
-      const existente = usuariosPlataforma.find(
-        (u) => String(u.email || "").toLowerCase() === email
-      );
-
-      let resultado;
+      let colaboradorId = existente?.id || null;
       if (existente) {
-        resultado = await supabase
-          .from("usuarios_plataforma")
-          .update(payload)
-          .eq("id", existente.id)
-          .select()
-          .single();
+        const { data, error } = await supabase.from("usuarios_plataforma")
+          .update(payload).eq("id", existente.id).select("id").single();
+        if (error) throw error;
+        colaboradorId = data.id;
       } else {
-        resultado = await supabase
-          .from("usuarios_plataforma")
-          .insert(payload)
-          .select()
-          .single();
+        const { data, error } = await supabase.from("usuarios_plataforma")
+          .insert(payload).select("id").single();
+        if (error) throw error;
+        colaboradorId = data.id;
       }
 
-      if (resultado.error) throw resultado.error;
-      if (!resultado.data?.id) throw new Error("O colaborador não foi confirmado pelo banco.");
+      const { data: acesso, error: erroAcesso } = await supabase.functions.invoke("gerenciar-acesso-usuario", {
+        body: { operacao: "criar_login", usuario_plataforma_id: colaboradorId, nova_senha: senha },
+      });
+      if (erroAcesso) throw new Error(`Colaborador salvo, mas login não criado: ${erroAcesso.message}`);
+      if (!acesso?.ok) throw new Error(`Colaborador salvo, mas login não criado: ${acesso?.error || "Erro desconhecido."}`);
 
       await registrarLog(
         existente ? "usuario_plataforma_atualizado" : "usuario_plataforma_cadastrado",
-        `${nome} salvo na Equipe PrecificaCont.`,
+        `Colaborador ${nome} salvo com login ativo no Authentication.`,
         null,
-        { perfil: payload.perfil, email: payload.email }
+        { usuario_plataforma_id: colaboradorId, perfil: payload.perfil, email }
       );
-
       setModalEquipe(false);
-      setSucesso(`${nome} salvo. As permissões podem ser ajustadas em Equipe PrecificaCont → Abrir usuário.`);
       await carregarTudo();
+      setSucesso(`Colaborador ${nome} cadastrado com login vinculado. A senha provisória não foi armazenada.`);
     } catch (e) {
       console.error("Erro ao salvar colaborador:", e);
-      setErro(
-        e?.message
-          ? `Não foi possível salvar o colaborador: ${e.message}`
-          : "Não foi possível salvar o colaborador."
-      );
+      setErro(e?.message || "Não foi possível salvar o colaborador.");
+      await carregarTudo();
     } finally {
       setSalvando(false);
     }
@@ -1141,15 +1151,14 @@ export default function PrecificaContControl({ sessao }) {
         throw new Error("Somente o Owner pode definir ou redefinir senhas.");
       }
       if (!usuario?.id) throw new Error("Colaborador não informado.");
-      if (!usuario?.user_id) {
-        throw new Error("Este colaborador ainda não possui login vinculado no Authentication.");
-      }
+      if (usuario.excluido_em) throw new Error("Colaborador excluído não pode receber senha.");
       if (!novaSenha || novaSenha.length < 8) {
         throw new Error("A senha deve possuir pelo menos 8 caracteres.");
       }
 
       const { data, error } = await supabase.functions.invoke("gerenciar-acesso-usuario", {
         body: {
+          operacao: usuario.user_id ? "redefinir_senha" : "criar_login",
           usuario_plataforma_id: usuario.id,
           nova_senha: novaSenha,
         },
@@ -1257,6 +1266,48 @@ export default function PrecificaContControl({ sessao }) {
       await carregarTudo();
     } catch (e) {
       setErro(e?.message || "Não foi possível atualizar o colaborador.");
+    }
+  };
+
+  const excluirEquipe = async (usuario) => {
+    if (perfilPlataforma?.perfil !== "owner") {
+      setErro("Somente o Owner pode excluir colaboradores.");
+      return false;
+    }
+    if (!usuario?.id || usuario.perfil === "owner" || usuario.user_id === sessao.user.id) {
+      setErro("Não é permitido excluir a conta Owner.");
+      return false;
+    }
+    const nome = usuario.nome || usuario.email || "este colaborador";
+    if (!window.confirm(`Remover ${nome} da equipe e excluir seu login no Authentication?\n\nLogs, metas e históricos serão preservados. Clientes com responsabilidade atribuída precisam ser redistribuídos antes.`)) return false;
+    if (!window.confirm(`Confirma a exclusão definitiva de ${nome}?`)) return false;
+
+    setSalvando(true);
+    setErro("");
+    setSucesso("");
+    try {
+      const { data, error } = await supabase.functions.invoke("gerenciar-acesso-usuario", {
+        body: { operacao: "excluir_colaborador", usuario_plataforma_id: usuario.id },
+      });
+      if (error) {
+        let detalhe = error.message;
+        try {
+          const resposta = await error.context?.json();
+          detalhe = resposta?.error || detalhe;
+        } catch (_) { /* Resposta sem JSON. */ }
+        throw new Error(detalhe || "Não foi possível excluir o colaborador.");
+      }
+      if (!data?.ok) throw new Error(data?.error || "Não foi possível excluir o colaborador.");
+      setSucesso(data.message || `Colaborador ${nome} excluído.`);
+      await carregarTudo();
+      return true;
+    } catch (e) {
+      console.error("Erro ao excluir colaborador:", e);
+      setErro(e?.message || "Não foi possível excluir o colaborador.");
+      await carregarTudo();
+      return false;
+    } finally {
+      setSalvando(false);
     }
   };
 
@@ -1707,6 +1758,7 @@ export default function PrecificaContControl({ sessao }) {
                   usuarioAtual={perfilPlataforma}
                   novoColaborador={() => setModalEquipe(true)}
                   alternarEquipe={alternarEquipe}
+                  excluirEquipe={excluirEquipe}
                   salvarPermissoesEquipe={salvarPermissoesEquipe}
                   definirSenhaColaborador={definirSenhaColaborador}
                   salvarCarteiraColaborador={salvarCarteiraColaborador}
@@ -2521,7 +2573,7 @@ function Financeiro({ resumo, cobrancas, escritorios, novaCobranca, alterarStatu
   );
 }
 
-function Equipe({ equipe, carteiras, escritorios, usuarioAtual, novoColaborador, alternarEquipe, salvarPermissoesEquipe, definirSenhaColaborador, salvarCarteiraColaborador, removerClienteDaCarteira, salvando }) {
+function Equipe({ equipe, carteiras, escritorios, usuarioAtual, novoColaborador, alternarEquipe, excluirEquipe, salvarPermissoesEquipe, definirSenhaColaborador, salvarCarteiraColaborador, removerClienteDaCarteira, salvando }) {
   const [abertoId, setAbertoId] = useState(null);
   const editaveis = equipe.filter((u) => u.perfil !== "owner");
   const aberto = editaveis.find((u) => u.id === abertoId) || null;
@@ -2539,6 +2591,8 @@ function Equipe({ equipe, carteiras, escritorios, usuarioAtual, novoColaborador,
         salvarCarteira={salvarCarteiraColaborador}
         removerCliente={removerClienteDaCarteira}
         alternarEquipe={alternarEquipe}
+        excluirEquipe={excluirEquipe}
+        podeExcluir={usuarioAtual?.perfil === "owner"}
         salvando={salvando}
         fechar={() => setAbertoId(null)}
       />
@@ -2584,7 +2638,7 @@ function Equipe({ equipe, carteiras, escritorios, usuarioAtual, novoColaborador,
   );
 }
 
-function FichaColaborador({ usuario, carteiras, escritorios, salvar, definirSenha, podeGerenciarCredenciais, salvarCarteira, removerCliente, alternarEquipe, salvando, fechar }) {
+function FichaColaborador({ usuario, carteiras, escritorios, salvar, definirSenha, podeGerenciarCredenciais, salvarCarteira, removerCliente, alternarEquipe, excluirEquipe, podeExcluir, salvando, fechar }) {
   const [f, setF] = useState({
     nome: usuario.nome || "",
     email: usuario.email || "",
@@ -2620,6 +2674,7 @@ function FichaColaborador({ usuario, carteiras, escritorios, salvar, definirSenh
         <div className="flex items-center gap-2">
           <Badge tipo={usuario.ativo !== false ? "ativo" : "inativo"}>{usuario.ativo !== false ? "Ativo" : "Inativo"}</Badge>
           <button onClick={()=>alternarEquipe(usuario)} className="rounded-xl border border-slate-200 px-3 py-2 text-xs font-black">{usuario.ativo !== false ? "Inativar" : "Ativar"}</button>
+          {podeExcluir ? <button disabled={salvando} onClick={async () => { const excluido = await excluirEquipe(usuario); if (excluido) fechar(); }} className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-xs font-black text-rose-700 disabled:opacity-50"><Trash2 size={13} className="mr-1 inline"/>Excluir definitivamente</button> : null}
         </div>
       </div>
 
@@ -2688,7 +2743,7 @@ function FichaColaborador({ usuario, carteiras, escritorios, salvar, definirSenh
           <div className="mt-4 flex flex-wrap items-center gap-3">
             <button
               type="button"
-              disabled={salvando || !usuario.user_id}
+              disabled={salvando}
               onClick={async()=>{
                 if (novaSenha.length < 8) { window.alert("A senha deve possuir pelo menos 8 caracteres."); return; }
                 if (novaSenha !== confirmarSenha) { window.alert("As senhas não conferem."); return; }
@@ -2701,7 +2756,7 @@ function FichaColaborador({ usuario, carteiras, escritorios, salvar, definirSenh
             >
               {salvando ? "Salvando..." : "Definir/Redefinir senha"}
             </button>
-            {!usuario.user_id ? <p className="text-xs font-semibold text-amber-700">Vincule primeiro este colaborador ao Supabase Authentication.</p> : null}
+            {!usuario.user_id ? <p className="text-xs font-semibold text-amber-700">Este colaborador ainda não possui login. Defina a senha para criá-lo automaticamente.</p> : null}
           </div>
           <p className="mt-3 text-[11px] leading-5 text-slate-400">A senha é enviada somente para a função segura do Supabase e não é salva na tabela de colaboradores.</p>
         </div>
@@ -4212,7 +4267,8 @@ function ModalEquipe({ fechar, salvar, salvando }) {
     financeiro:{label:"Financeiro",permissoes:{pode_ver_todos_clientes:false,pode_ver_financeiro:true,pode_acessar_cliente:false,pode_gerenciar_equipe:false}},
     leitura:{label:"Somente leitura",permissoes:{pode_ver_todos_clientes:false,pode_ver_financeiro:false,pode_acessar_cliente:false,pode_gerenciar_equipe:false}},
   };
-  const [f,setF]=useState({nome:"",email:"",cargo:"",perfil:"comercial",...perfis.comercial.permissoes});
+  const [f,setF]=useState({nome:"",email:"",cargo:"",perfil:"comercial",senha:"",confirmarSenha:"",...perfis.comercial.permissoes});
+  const [mostrarSenhaInicial,setMostrarSenhaInicial]=useState(false);
   const set=(k,v)=>setF(x=>({...x,[k]:v}));
   const aplicar=(perfil)=>setF(x=>({...x,perfil,...perfis[perfil].permissoes}));
 
@@ -4226,6 +4282,16 @@ function ModalEquipe({ fechar, salvar, salvando }) {
           {Object.entries(perfis).map(([id,p])=><option key={id} value={id}>{p.label}</option>)}
         </select>
       </Campo>
+    </div>
+
+    <div className="mt-5 rounded-2xl border border-blue-200 bg-blue-50/50 p-4">
+      <p className="text-sm font-black text-slate-900">Acesso inicial ao sistema</p>
+      <p className="mt-1 text-xs text-slate-500">O e-mail informado será o login. A senha provisória será enviada apenas à função segura do Supabase.</p>
+      <div className="mt-3 grid gap-3 sm:grid-cols-2">
+        <Campo label="Senha provisória *"><input className="input-control" type={mostrarSenhaInicial ? "text" : "password"} autoComplete="new-password" value={f.senha} onChange={e=>set("senha",e.target.value)} placeholder="Mínimo de 8 caracteres" /></Campo>
+        <Campo label="Confirmar senha *"><input className="input-control" type={mostrarSenhaInicial ? "text" : "password"} autoComplete="new-password" value={f.confirmarSenha} onChange={e=>set("confirmarSenha",e.target.value)} placeholder="Repita a senha" /></Campo>
+      </div>
+      <label className="mt-3 inline-flex items-center gap-2 text-xs font-semibold text-slate-600"><input type="checkbox" checked={mostrarSenhaInicial} onChange={e=>setMostrarSenhaInicial(e.target.checked)} />Mostrar senha</label>
     </div>
 
     <div className="mt-5 rounded-2xl border border-slate-200 p-4">
@@ -4256,7 +4322,7 @@ function ModalEquipe({ fechar, salvar, salvando }) {
     </div>
 
     <div className="mt-4 rounded-xl bg-amber-50 px-4 py-3 text-xs leading-5 text-amber-800">
-      Este cadastro cria o colaborador e suas permissões no Control. A ativação do login será vinculada ao e-mail na etapa de autenticação, sem você precisar informar UUID.
+      Ao salvar, o login será criado automaticamente no Supabase Authentication e vinculado ao colaborador. A senha não é armazenada na tabela do Control.
     </div>
 
     <button onClick={()=>salvar(f)} disabled={salvando} className="mt-6 rounded-xl bg-blue-600 px-5 py-3 text-sm font-bold text-white disabled:opacity-60">
